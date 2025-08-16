@@ -1,6 +1,7 @@
 import mediapipe as mp
 import cv2
 import time
+import threading
 import math
 import numpy as np
 from dotenv import load_dotenv
@@ -8,6 +9,8 @@ import os
 import base64
 from requests import post
 import requests
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from comtypes import CLSCTX_ALL
 
 load_dotenv()
 client_id = os.getenv("SPOTIFY_CLIENT_ID")
@@ -33,12 +36,6 @@ access_token = refresh_token(saved_refresh_token)
 headers = {"Authorization": f"Bearer {access_token}"}
 print(f"Access Token: {access_token}")
 
-''''	
-Play/Pause	        PUT /v1/me/player/play
-Get Current Track	GET /v1/me/player
-Skip Next	        POST /v1/me/player/next
-Volume	            PUT /v1/me/player/volume?volume_percent=50
-'''
 
 class Face():
     def __init__(self, nb_faces=1, min_conf=0.5):
@@ -50,6 +47,7 @@ class Face():
                                                    min_tracking_confidence=min_conf)
         # Drawing specifications for landmarks and connections
         self.drawing_spec = mp.solutions.drawing_utils.DrawingSpec(color=(0,255,0), thickness=1, circle_radius=1)
+        self.gesture_controller = GestureController()
     
     def calculate_angle(self, p1, p2):
 
@@ -59,11 +57,11 @@ class Face():
         angle_degrees = np.degrees(angle_rad)
         return angle_degrees
 
-    def face_state(self, angle, threshold=30):
+    def face_state(self, angle, threshold=20):
         if angle < -threshold:
-            return "LEFT"
+            return "Left"
         elif angle > threshold:
-            return "RIGHT"
+            return "Right"
         else:
             return "Neutral"
 
@@ -107,6 +105,8 @@ class Face():
                                 (forehead_coords[0], forehead_coords[1] - 10), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                     state = self.face_state(calculated_angle, threshold=30)
+                    print(f"Face State: {state}")
+                    self.gesture_controller.update(state)
                     cv2.putText(image_bgr, f'State: {state}', 
                                 (forehead_coords[0], forehead_coords[1] - 30), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
@@ -122,6 +122,7 @@ class Hand():
                                        min_tracking_confidence=min_conf)
         # Drawing specifications for landmarks and connections
         self.drawing_spec = mp.solutions.drawing_utils.DrawingSpec(color=(0,255,0), thickness=1, circle_radius=1)
+        self.gesture_controller = GestureController()
     
     def right_hand_state(self, hand_landmarks):
         thumb_tip, thumb_base = hand_landmarks.landmark[4].y, hand_landmarks.landmark[2].y
@@ -145,9 +146,9 @@ class Hand():
                 # Swap labels to mirror the handedness
                 if label_mirror:
                     if label == "Left":
-                        label = "right"
+                        label = "Right"
                     elif label == "Right":
-                        label = "left"
+                        label = "Left"
                 score = handedness.classification[0].score  # confidence
 
                 h, w, _ = image_bgr.shape
@@ -157,9 +158,12 @@ class Hand():
                 x2, y2 = int(index.x * w), int(index.y * h)
                 
                 if draw:
-                    if label == "left":
-                        distace = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-                        cv2.putText(image_bgr, f'distance: {distace:.2f}', (int((x1 + x2)/2), int((y1 + y2)/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    if label == "Left":
+                        if not self.gesture_controller.vol_adjusting and not self.gesture_controller.vol_blocked:
+                            self.gesture_controller.start_vol_adjust_delay()
+                        distance = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+                        self.gesture_controller.adjust_volume(distance)
+                        cv2.putText(image_bgr, f'distance: {distance:.2f}', (int((x1 + x2)/2), int((y1 + y2)/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                         cv2.putText(image_bgr, f'Left Hand: {score:.2f}', (int(hand_landmarks.landmark[0].x * w), int(hand_landmarks.landmark[0].y * h)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                         cv2.line(image_bgr, (x1, y1), (x2, y2), (255, 0, 0), 2)
                         cv2.circle(image_bgr, (x1, y1), 5, (255, 0, 0), cv2.FILLED)
@@ -174,8 +178,9 @@ class Hand():
                             landmark_drawing_spec=self.drawing_spec,
                             connection_drawing_spec=self.drawing_spec
                         )
-                    elif label == "right":
+                    elif label == "Right":
                         rh_state = self.right_hand_state(hand_landmarks)
+                        self.gesture_controller.update(rh_state)
                         cv2.putText(image_bgr, f'Right Hand: {rh_state}', (int(hand_landmarks.landmark[0].x * w), int(hand_landmarks.landmark[0].y * h) - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                         cv2.putText(image_bgr, f'Right Hand: {score:.2f}', (int(hand_landmarks.landmark[0].x * w), int(hand_landmarks.landmark[0].y * h)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
@@ -190,12 +195,42 @@ class Hand():
         return image_bgr
 
 class GestureController():
-    def __init__(self, min_frames=10, sleep_time=2):
+    def __init__(self, min_frames=10, sleep_time=2.0):
         self.min_frames = min_frames
         self.sleep_time = sleep_time
         self.history = []
+        self.toggle = True
+        self.vol_adjusting = False
+        self.vol_blocked = False
 
-    def commands(self, state, vol):
+    def start_vol_adjust_delay(self):
+        if not self.vol_adjusting and not self.vol_blocked:
+            threading.Timer(1.0, self.enable_adjustment).start() #prevent immediate adjustment
+
+    def enable_adjustment(self):
+        self.vol_adjusting = True
+        threading.Timer(3.0, self.block_adjustment).start() 
+
+    def block_adjustment(self):
+        self.vol_adjusting = False
+        self.vol_blocked = True
+        threading.Timer(2.0, self.reset_block).start()
+
+    def reset_block(self):
+        self.vol_blocked = False
+
+    def adjust_volume(self, distance, max_distance=250):
+        if self.vol_adjusting and not self.vol_blocked:
+            self.start_vol_adjust_delay()
+            distance = max(0, min(distance, max_distance))
+            volume_level = distance / max_distance
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = interface.QueryInterface(IAudioEndpointVolume)
+            volume.SetMasterVolumeLevelScalar(volume_level, None)
+            print("Adjusting Volume")
+
+    def commands(self, state):
         if state == "High Five":
             requests.put("https://api.spotify.com/v1/me/player/pause", headers=headers)
             print("Executing High Five Command")
@@ -208,16 +243,28 @@ class GestureController():
         elif state == "Right":
             requests.post("https://api.spotify.com/v1/me/player/next", headers=headers)
             print("Executing Right Command")
-        else:
-            requests.put("https://api.spotify.com/v1/me/player/volume?volume_percent=vol", headers=headers)
-            print("Adjusting Volume")
 
+    def lock_toggle(self):
+        self.toggle = False
+        threading.Timer(self.sleep_time, self.unlock_toggle).start()
+
+    def unlock_toggle(self):
+        self.toggle = True
+        self.history.clear()
+    
     def update(self, state):
-        if state == "Neutral" or "Other":
+        if state in ("Neutral", "Other"):
             self.history.clear()
+        elif not self.history or state != self.history[-1]:
+            self.history = [state]
         else:
             self.history.append(state)
-    def get_state(self, face_state, hand_state): 
+            if len(self.history) >= self.min_frames and self.toggle:
+                self.commands(state)
+                self.lock_toggle()
+                
+                
+        
 
 
 video = cv2.VideoCapture(0)
