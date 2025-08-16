@@ -1,0 +1,53 @@
+# requirements.txt
+
+# Core Computer Vision & MediaPipe
+opencv-python>=4.7.0
+mediapipe>=0.10.0
+
+# Audio control for Windows
+pycaw>=2019.0.1
+comtypes>=1.1.11
+
+# System automation
+pyautogui>=0.9.55
+
+# Data handling & computation
+numpy>=1.24.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# threading and time are standard, no install needed
+
+# Spotify API usage
+spotipy>=2.26.1
+
+# Setup Instructions
+
+1. Install dependencies
+
+2. Spotify Developer App:
+  Go to Spotify Developer Dashboard
+  Create a new app.
+  Copy Client ID and Client Secret.
+  Add a redirect URI: http://localhost:8888/callback
+
+3.Environment Variables:
+  Create a .env file in the project root:
+    SPOTIFY_CLIENT_ID=your_client_id_here
+    SPOTIFY_CLIENT_SECRET=your_client_secret_here
+    SPOTIFY_REDIRECT_URI=http://localhost:8888/callback
+
+4. Get Authorization Code:
+Run the local server provided by Spotipy or your auth script:
+bash
+python server.py
+Follow the link in terminal, login to Spotify, and copy the returned code.
+
+5. Generate Token:
+Use get_code_for_autorization.py (or the provided script) to exchange the auth code for an access token.
+Store token securely or in .env.
+
+6.Refresh Token:
+Tokens expire; call the refresh function to get a new token automatically before API calls.
+
+
